@@ -1,4 +1,4 @@
-name: CI/CD Pipeline - Notes App con Trivy Security (3 Fases & TP10B)
+name: CI/CD Pipeline - Notes App DevSecOps (Gitleaks, Trivy & Semgrep)
 
 on:
   push:
@@ -42,7 +42,7 @@ jobs:
           retention-days: 1
 
   # =========================================================================
-  # FASE 2A: AUDITORÍA DE SEGURIDAD - ANDON CORD (HIGH/CRITICAL)
+  # FASE 2A: AUDITORÍA DE SEGURIDAD - TRIVY ANDON CORD (HIGH/CRITICAL)
   # =========================================================================
   trivy-andon-cord:
     name: "Fase 2A: Trivy - Andon Cord (HIGH/CRITICAL)"
@@ -67,9 +67,6 @@ jobs:
         with:
           version: 'v3.13.0'
 
-      # -------------------------------------------------------------
-      # APLICACIÓN PATRÓN TP10B: Renderizado previo de Helm
-      # -------------------------------------------------------------
       - name: Renderizar Helm Chart (TP10B - Sin Falsos Positivos)
         run: |
           helm template ${{ env.HELM_RELEASE_NAME }} ./devops-tp12/chart -f devops-tp12/values-local.yaml > manifests-rendered-prod.yaml
@@ -79,8 +76,8 @@ jobs:
         with:
           image-ref: '${{ env.DOCKER_IMAGE }}:${{ github.sha }}'
           format: 'table'
-          exit-code: '1'          # Detiene el pipeline si hay hallazgos
-          ignore-unfixed: true   # Filtra CVEs con solución disponible
+          exit-code: '1'
+          ignore-unfixed: true
           severity: 'HIGH,CRITICAL'
 
       - name: Escaneo de IaC sobre YAML Renderizado (Trivy Config)
@@ -101,7 +98,7 @@ jobs:
           echo "| **Contenedor, SCA e IaC Renderizado** | \`HIGH, CRITICAL\` | **Andon Cord Activo** (Bloquea si hay CVEs) |" >> $GITHUB_STEP_SUMMARY
 
   # =========================================================================
-  # FASE 2B: AUDITORÍA DE SEGURIDAD - REPORTE INFORMATIVO (LOW/MEDIUM)
+  # FASE 2B: AUDITORÍA DE SEGURIDAD - TRIVY REPORTE INFORMATIVO (LOW/MEDIUM)
   # =========================================================================
   trivy-audit-report:
     name: "Fase 2B: Trivy - Reporte e Inspección (LOW/MEDIUM)"
@@ -127,7 +124,7 @@ jobs:
         with:
           image-ref: '${{ env.DOCKER_IMAGE }}:${{ github.sha }}'
           format: 'table'
-          exit-code: '0'          # Permite continuar el flujo
+          exit-code: '0'
           severity: 'LOW,MEDIUM'
           output: 'trivy-low-medium-report.txt'
 
@@ -147,12 +144,78 @@ jobs:
           echo '```' >> $GITHUB_STEP_SUMMARY
 
   # =========================================================================
+  # FASE 2C: GITLEAKS - ANDON CORD (Bloqueante ante Secretos Expuestos)
+  # =========================================================================
+  gitleaks-andon-cord:
+    name: "Fase 2C: Gitleaks - Andon Cord (Secret Detection)"
+    runs-on: ubuntu-latest
+    needs: [build-and-package]
+    steps:
+      - name: Checkout del código (Historial completo para análisis)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Escaneo de Secretos con Gitleaks Action
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: false
+
+      - name: Resumen de Andon Cord en GitHub
+        if: always()
+        run: |
+          echo "### Auditoría de Secretos (Gitleaks) :key:" >> $GITHUB_STEP_SUMMARY
+          echo "| Evaluación | Tipo de Control | Acción en Pipeline |" >> $GITHUB_STEP_SUMMARY
+          echo "|------------|-----------------|--------------------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Fuga de Secretos** | **Andon Cord Activo** | Bloquea el merge si se detectan credenciales |" >> $GITHUB_STEP_SUMMARY
+
+  # =========================================================================
+  # FASE 2D: GITLEAKS - REPORTE DE INSPECCIÓN (Artifact JSON)
+  # =========================================================================
+  gitleaks-audit-report:
+    name: "Fase 2D: Gitleaks - Reporte e Inspección (Artifacts)"
+    runs-on: ubuntu-latest
+    needs: [build-and-package, gitleaks-andon-cord]
+    if: always()
+    steps:
+      - name: Checkout del código (Historial completo)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Instalación de Gitleaks CLI
+        run: |
+          wget https://github.com/gitleaks/gitleaks/releases/download/v8.18.2/gitleaks_8.18.2_linux_x64.tar.gz
+          tar -xzf gitleaks_8.18.2_linux_x64.tar.gz
+          sudo mv gitleaks /usr/local/bin/
+
+      - name: Generar Reporte de Auditoría en JSON
+        run: |
+          gitleaks detect --source . --report-format json --report-path gitleaks-report.json || true
+
+      - name: Publicar Artifact de Auditoría de Secretos
+        uses: actions/upload-artifact@v4
+        with:
+          name: reporte-fuga-secretos-gitleaks
+          path: gitleaks-report.json
+          retention-days: 14
+
+      - name: Publicar Resumen en $GITHUB_STEP_SUMMARY
+        run: |
+          echo "### Reporte de Inspección de Secretos (Gitleaks) :clipboard:" >> $GITHUB_STEP_SUMMARY
+          echo "El informe JSON detallado de auditoría de Git se ha adjuntado como **Artifact**." >> $GITHUB_STEP_SUMMARY
+          echo '```json' >> $GITHUB_STEP_SUMMARY
+          head -n 30 gitleaks-report.json || echo "[]" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  # =========================================================================
   # FASE 3: RELEASE & DEPLOY (Publicación y Despliegue Post-Aprobación)
   # =========================================================================
   deploy-k8s-helm:
     name: "Fase 3: Release & Deploy Helm K8s"
     runs-on: ubuntu-latest
-    needs: [build-and-package, trivy-andon-cord, trivy-audit-report]
+    needs: [build-and-package, trivy-andon-cord, trivy-audit-report, gitleaks-andon-cord, gitleaks-audit-report]
     if: github.ref == 'refs/heads/main'
     steps:
       - name: Checkout del código
@@ -184,4 +247,3 @@ jobs:
         run: |
           echo "Desplegando Helm Chart '${{ env.HELM_RELEASE_NAME }}' en namespace '${{ env.K8S_NAMESPACE }}'..."
           # helm upgrade --install ${{ env.HELM_RELEASE_NAME }} ./devops-tp12/chart -n ${{ env.K8S_NAMESPACE }}
-
